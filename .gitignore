@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+*.m4a
+*.mp3
+*.wav
+*.ogg
+*.opus
+*_transcript.md
