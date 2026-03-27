@@ -8,6 +8,7 @@ and multi-pass temperature-varied verification to surface low-confidence regions
 import argparse
 import concurrent.futures
 import difflib
+import re
 import sys
 import os
 
@@ -25,6 +26,9 @@ def get_context_from_user():
     speaker_names = input(
         "Speaker names, comma-separated (e.g. 'Sam, Taylor') or leave blank: "
     ).strip()
+    who_speaks_first = input(
+        "Who speaks first? (name or leave blank if unsure): "
+    ).strip()
     description = input(
         "Brief description of the audio (e.g. 'job interview', 'podcast episode'): "
     ).strip()
@@ -35,6 +39,7 @@ def get_context_from_user():
         "speaker_names": [s.strip() for s in speaker_names.split(",")]
         if speaker_names
         else [],
+        "who_speaks_first": who_speaks_first,
         "description": description,
         "extra": extra,
     }
@@ -46,6 +51,7 @@ def build_prompt(context):
     names = context["speaker_names"]
     desc = context["description"]
     extra = context["extra"]
+    first = context.get("who_speaks_first", "")
 
     if names and len(names) == num:
         speaker_instruction = (
@@ -60,11 +66,12 @@ def build_prompt(context):
         )
         example_label = "Speaker 1"
 
+    first_line = f"\nIMPORTANT: {first} is the first person to speak in this recording.\n" if first else ""
     desc_line = f"\nContext: this audio is a {desc}.\n" if desc else ""
     extra_line = f"\nAdditional instructions: {extra}\n" if extra else ""
 
     return f"""Transcribe this entire audio recording word-for-word, completely verbatim with timestamps.
-{desc_line}{extra_line}
+{first_line}{desc_line}{extra_line}
 CRITICAL RULES:
 - Do NOT summarize, condense, paraphrase, or skip ANY part of the conversation
 - Include every single word spoken, including all filler words (um, uh, like, you know, etc.)
@@ -73,14 +80,27 @@ CRITICAL RULES:
 - Do NOT clean up grammar or make the speech sound more polished
 - The transcript must cover the ENTIRE recording from start to finish with NOTHING omitted
 - If a speaker trails off or restarts a sentence, transcribe that exactly
-- Include all pauses (note them as [pause] where they occur)
 - Do NOT hallucinate or fabricate any words. If something is unclear, mark it as [inaudible]
 - Accuracy is the #1 priority. Only write what was actually said.
+
+NON-VERBAL SOUNDS — capture ALL of these:
+- Laughter: [laughs], [short laugh], [extended laughter ~3s], [both laugh], [chuckles]
+- Pauses: [pause], [long pause ~5s], [silence ~3s]
+- Other sounds: [sighs], [coughs], [clears throat], [paper rustling], [typing sounds], [phone buzzing], [background noise], [door closing]
+- Reactions: [exhales], [inhales sharply], [sniffs]
+- Include approximate duration for anything lasting more than ~2 seconds, e.g. [laughter ~4s]
+- Note if both speakers laugh or react simultaneously, e.g. [both laugh ~3s]
+
+SPEAKER ATTRIBUTION — be extremely careful:
+- Pay close attention to which voice is speaking. Each speaker has a distinct voice — do not mix them up.
+- If you are unsure who is speaking, mark it as [speaker uncertain]
+- When a speaker gives a brief interjection (e.g. "yeah", "mm-hmm") while the other is talking, note it inline: ...sentence [Speaker 2: mm-hmm] continuing sentence...
+- Consistency matters: once you identify a voice as a particular speaker, maintain that mapping throughout.
 
 FORMAT:
 - {speaker_instruction}
 - Include a timestamp at the start of each speaker turn, in [MM:SS] format
-- Example: [00:00] {example_label}: Hello, how are you?
+- Example: [00:00] {example_label}: Hello, how are you? [short laugh]
 
 The transcript should be very long and complete. If it seems short, you are summarizing — go back and include everything."""
 
@@ -107,24 +127,62 @@ def single_transcribe(audio_file, model_name, prompt, pass_num, temperature, max
                 raise
 
 
+def _extract_speaker(line):
+    """Extract the speaker label from a transcript line, if any."""
+    m = re.match(r'\[?\d{1,2}:\d{2}\]?\s*(.+?):', line)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _classify_diff(removed_line, added_line):
+    """Classify a diff pair into severity categories."""
+    r_speaker = _extract_speaker(removed_line)
+    a_speaker = _extract_speaker(added_line)
+
+    # Speaker misattribution — different speaker labels for similar content
+    if r_speaker and a_speaker and r_speaker != a_speaker:
+        # Strip speaker labels and timestamps to compare content
+        r_content = re.sub(r'^\[?\d{1,2}:\d{2}\]?\s*.+?:\s*', '', removed_line)
+        a_content = re.sub(r'^\[?\d{1,2}:\d{2}\]?\s*.+?:\s*', '', added_line)
+        similarity = difflib.SequenceMatcher(None, r_content, a_content).ratio()
+        if similarity > 0.5:
+            return "speaker_swap"
+
+    # Timestamp-only difference
+    r_no_ts = re.sub(r'\[?\d{1,2}:\d{2}\]?', '', removed_line).strip()
+    a_no_ts = re.sub(r'\[?\d{1,2}:\d{2}\]?', '', added_line).strip()
+    if r_no_ts == a_no_ts:
+        return "timestamp"
+
+    # Minor wording / punctuation
+    r_words = re.sub(r'[^\w\s]', '', removed_line.lower()).split()
+    a_words = re.sub(r'[^\w\s]', '', added_line.lower()).split()
+    similarity = difflib.SequenceMatcher(None, r_words, a_words).ratio()
+    if similarity > 0.9:
+        return "minor"
+
+    return "content"
+
+
 def compare_passes(results, temps):
-    """Compare all passes and return a diff report highlighting low-confidence regions."""
+    """Compare all passes and return a categorized diff report."""
     keys = sorted(results.keys())
     pairs = [(keys[i], keys[j]) for i in range(len(keys)) for j in range(i + 1, len(keys))]
 
     report_lines = ["# Transcription Verification Report\n"]
     report_lines.append("## Strategy")
-    report_lines.append("Temperature-varied multi-pass: the primary transcript (Pass 1) is")
-    report_lines.append("generated at temp 0.0 for determinism. Additional passes use higher")
-    report_lines.append("temperatures to surface low-confidence regions — words/phrases where")
-    report_lines.append("the model is uncertain will appear as differences.\n")
+    report_lines.append("Temperature-varied multi-pass: Pass 1 is the primary transcript at low")
+    report_lines.append("temperature. Additional passes use higher temperatures to surface")
+    report_lines.append("low-confidence regions. Differences are categorized by severity.\n")
     for k in keys:
         report_lines.append(f"- Pass {k}: {len(results[k].split())} words (temp={temps[k - 1]})")
     report_lines.append("")
 
-    # Collect all differing line numbers across pairs
-    all_low_confidence = set()
-    total_diffs = 0
+    total_speaker_swaps = 0
+    total_content_diffs = 0
+    total_minor_diffs = 0
+    total_timestamp_diffs = 0
 
     for a, b in pairs:
         a_lines = results[a].splitlines()
@@ -134,30 +192,93 @@ def compare_passes(results, temps):
             fromfile=f"Pass {a} (temp={temps[a - 1]})",
             tofile=f"Pass {b} (temp={temps[b - 1]})"
         ))
-        content_diffs = [
-            l for l in diff
-            if (l.startswith("+") or l.startswith("-"))
-            and not l.startswith("+++") and not l.startswith("---")
-        ]
-        total_diffs += len(content_diffs)
 
-        report_lines.append(f"\n## Pass {a} vs Pass {b} ({len(content_diffs)} differing lines)\n")
-        if content_diffs:
-            report_lines.append("**[LOW CONFIDENCE]** — These sections varied across temperature passes:\n")
+        # Pair up removed/added lines for classification
+        removed = [l for l in diff if l.startswith("-") and not l.startswith("---")]
+        added = [l for l in diff if l.startswith("+") and not l.startswith("+++")]
+        speaker_swaps = []
+        content_diffs = []
+        minor_diffs = []
+        timestamp_diffs = []
+
+        # Classify paired diffs
+        for r, a_line in zip(removed, added):
+            category = _classify_diff(r[1:], a_line[1:])
+            pair = (r, a_line)
+            if category == "speaker_swap":
+                speaker_swaps.append(pair)
+            elif category == "content":
+                content_diffs.append(pair)
+            elif category == "minor":
+                minor_diffs.append(pair)
+            else:
+                timestamp_diffs.append(pair)
+
+        # Handle unpaired lines (insertions/deletions with no match)
+        extra = abs(len(removed) - len(added))
+        if extra > 0:
+            content_diffs.extend(
+                [(l, "") for l in (removed if len(removed) > len(added) else added)[min(len(removed), len(added)):]]
+            )
+
+        total_speaker_swaps += len(speaker_swaps)
+        total_content_diffs += len(content_diffs)
+        total_minor_diffs += len(minor_diffs)
+        total_timestamp_diffs += len(timestamp_diffs)
+
+        report_lines.append(f"\n## Pass {a} vs Pass {b}\n")
+
+        if speaker_swaps:
+            report_lines.append(f"### SPEAKER MISATTRIBUTION ({len(speaker_swaps)} found) — REVIEW THESE\n")
+            report_lines.append("The model assigned different speakers to the same content across passes.\n")
             report_lines.append("```diff")
-            for line in diff:
-                if line.startswith("@@") or line.startswith("+") or line.startswith("-"):
-                    report_lines.append(line)
-            report_lines.append("```")
-        else:
-            report_lines.append("No differences — high confidence in this comparison.")
+            for r, a_line in speaker_swaps:
+                report_lines.append(r)
+                report_lines.append(a_line)
+            report_lines.append("```\n")
 
-    if total_diffs == 0:
-        report_lines.insert(2, "\n**RESULT: All passes identical — high confidence across all regions.**\n")
+        if content_diffs:
+            report_lines.append(f"### Content differences ({len(content_diffs)} found)\n")
+            report_lines.append("Different words/phrases — worth spot-checking.\n")
+            report_lines.append("```diff")
+            for r, a_line in content_diffs:
+                report_lines.append(r)
+                if a_line:
+                    report_lines.append(a_line)
+            report_lines.append("```\n")
+
+        if minor_diffs:
+            report_lines.append(f"### Minor wording/punctuation ({len(minor_diffs)} found)\n")
+            report_lines.append("```diff")
+            for r, a_line in minor_diffs:
+                report_lines.append(r)
+                report_lines.append(a_line)
+            report_lines.append("```\n")
+
+        if timestamp_diffs:
+            report_lines.append(f"### Timestamp-only ({len(timestamp_diffs)} found) — safe to ignore\n")
+
+        if not any([speaker_swaps, content_diffs, minor_diffs, timestamp_diffs]):
+            report_lines.append("No differences — high confidence.\n")
+
+    # Summary at top
+    total_all = total_speaker_swaps + total_content_diffs + total_minor_diffs + total_timestamp_diffs
+    summary = ["\n## Summary\n"]
+    if total_all == 0:
+        summary.append("**All passes identical — high confidence across all regions.**\n")
     else:
-        report_lines.insert(2, f"\n**RESULT: {total_diffs} differences found — review [LOW CONFIDENCE] sections below.**\n")
+        if total_speaker_swaps:
+            summary.append(f"- **SPEAKER MISATTRIBUTIONS: {total_speaker_swaps}** — review these manually\n")
+        if total_content_diffs:
+            summary.append(f"- Content differences: {total_content_diffs} — worth spot-checking\n")
+        if total_minor_diffs:
+            summary.append(f"- Minor wording/punctuation: {total_minor_diffs} — low risk\n")
+        if total_timestamp_diffs:
+            summary.append(f"- Timestamp-only: {total_timestamp_diffs} — safe to ignore\n")
 
-    return "\n".join(report_lines), total_diffs
+    report_lines[1:1] = summary
+
+    return "\n".join(report_lines), total_all
 
 
 def transcribe(audio_path, api_key, model_name, context, passes=3, temps=None):
@@ -252,6 +373,7 @@ def main():
         context = {
             "num_speakers": 2,
             "speaker_names": [],
+            "who_speaks_first": "",
             "description": "",
             "extra": "",
         }
