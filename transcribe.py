@@ -2,7 +2,7 @@
 """
 Transcribe audio files using Gemini's native audio understanding.
 Supports speaker diarization, timestamps, verbatim transcription,
-and multi-pass verification to catch hallucinations.
+and multi-pass temperature-varied verification to surface low-confidence regions.
 """
 
 import argparse
@@ -12,6 +12,8 @@ import sys
 import os
 
 import google.generativeai as genai
+
+DEFAULT_TEMPS = [0.05, 0.2, 0.3]
 
 
 def get_context_from_user():
@@ -83,40 +85,54 @@ FORMAT:
 The transcript should be very long and complete. If it seems short, you are summarizing — go back and include everything."""
 
 
-def single_transcribe(audio_file, model_name, prompt, pass_num):
-    """Run a single transcription pass."""
-    print(f"  Pass {pass_num} started...")
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content(
-        [audio_file, prompt],
-        generation_config={"max_output_tokens": 65000, "temperature": 0.0},
-    )
-    word_count = len(response.text.split())
-    print(f"  Pass {pass_num} done ({word_count} words)")
-    return response.text
+def single_transcribe(audio_file, model_name, prompt, pass_num, temperature, max_retries=2):
+    """Run a single transcription pass at the given temperature with retry."""
+    for attempt in range(max_retries + 1):
+        try:
+            label = f"Pass {pass_num}" + (f" (retry {attempt})" if attempt > 0 else "")
+            print(f"  {label} started (temp={temperature})...")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                [audio_file, prompt],
+                generation_config={"max_output_tokens": 65000, "temperature": temperature},
+            )
+            text = response.text
+            word_count = len(text.split())
+            print(f"  {label} done ({word_count} words, temp={temperature})")
+            return text
+        except (ValueError, Exception) as e:
+            if attempt < max_retries:
+                print(f"  Pass {pass_num} failed ({e}), retrying...")
+            else:
+                raise
 
 
-def compare_passes(results):
-    """Compare all passes and return a diff report."""
-    pairs = []
+def compare_passes(results, temps):
+    """Compare all passes and return a diff report highlighting low-confidence regions."""
     keys = sorted(results.keys())
-    for i in range(len(keys)):
-        for j in range(i + 1, len(keys)):
-            pairs.append((keys[i], keys[j]))
+    pairs = [(keys[i], keys[j]) for i in range(len(keys)) for j in range(i + 1, len(keys))]
 
     report_lines = ["# Transcription Verification Report\n"]
-    report_lines.append(f"{len(results)} independent transcription passes\n")
+    report_lines.append("## Strategy")
+    report_lines.append("Temperature-varied multi-pass: the primary transcript (Pass 1) is")
+    report_lines.append("generated at temp 0.0 for determinism. Additional passes use higher")
+    report_lines.append("temperatures to surface low-confidence regions — words/phrases where")
+    report_lines.append("the model is uncertain will appear as differences.\n")
     for k in keys:
-        report_lines.append(f"- Pass {k}: {len(results[k].split())} words")
+        report_lines.append(f"- Pass {k}: {len(results[k].split())} words (temp={temps[k - 1]})")
     report_lines.append("")
 
+    # Collect all differing line numbers across pairs
+    all_low_confidence = set()
     total_diffs = 0
+
     for a, b in pairs:
         a_lines = results[a].splitlines()
         b_lines = results[b].splitlines()
         diff = list(difflib.unified_diff(
             a_lines, b_lines, lineterm="",
-            fromfile=f"Pass {a}", tofile=f"Pass {b}"
+            fromfile=f"Pass {a} (temp={temps[a - 1]})",
+            tofile=f"Pass {b} (temp={temps[b - 1]})"
         ))
         content_diffs = [
             l for l in diff
@@ -124,22 +140,35 @@ def compare_passes(results):
             and not l.startswith("+++") and not l.startswith("---")
         ]
         total_diffs += len(content_diffs)
+
         report_lines.append(f"\n## Pass {a} vs Pass {b} ({len(content_diffs)} differing lines)\n")
         if content_diffs:
+            report_lines.append("**[LOW CONFIDENCE]** — These sections varied across temperature passes:\n")
             report_lines.append("```diff")
             for line in diff:
                 if line.startswith("@@") or line.startswith("+") or line.startswith("-"):
                     report_lines.append(line)
             report_lines.append("```")
         else:
-            report_lines.append("No differences.")
+            report_lines.append("No differences — high confidence in this comparison.")
+
+    if total_diffs == 0:
+        report_lines.insert(2, "\n**RESULT: All passes identical — high confidence across all regions.**\n")
+    else:
+        report_lines.insert(2, f"\n**RESULT: {total_diffs} differences found — review [LOW CONFIDENCE] sections below.**\n")
 
     return "\n".join(report_lines), total_diffs
 
 
-def transcribe(audio_path, api_key, model_name, context, passes=1):
-    """Upload audio and transcribe with Gemini, optionally with multi-pass verification."""
+def transcribe(audio_path, api_key, model_name, context, passes=3, temps=None):
+    """Upload audio and transcribe with Gemini using temperature-varied multi-pass verification."""
     genai.configure(api_key=api_key)
+
+    if temps is None:
+        temps = DEFAULT_TEMPS[:passes]
+    # Pad with 0.0 if user specified fewer temps than passes
+    while len(temps) < passes:
+        temps.append(0.0)
 
     print(f"\nUploading {audio_path}...")
     audio_file = genai.upload_file(audio_path)
@@ -148,19 +177,17 @@ def transcribe(audio_path, api_key, model_name, context, passes=1):
     prompt = build_prompt(context)
 
     if passes == 1:
-        print("Transcribing (this may take a few minutes)...")
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(
-            [audio_file, prompt],
-            generation_config={"max_output_tokens": 65000, "temperature": 0.0},
-        )
-        return response.text, None, None
+        text = single_transcribe(audio_file, model_name, prompt, 1, temps[0])
+        return text, None, None
 
-    # Multi-pass concurrent transcription
+    # Multi-pass concurrent transcription with varied temperatures
     print(f"Running {passes} concurrent transcriptions for verification...")
+    print(f"  Temperature schedule: {', '.join(str(t) for t in temps[:passes])}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=passes) as executor:
         futures = {
-            executor.submit(single_transcribe, audio_file, model_name, prompt, i): i
+            executor.submit(
+                single_transcribe, audio_file, model_name, prompt, i, temps[i - 1]
+            ): i
             for i in range(1, passes + 1)
         }
         results = {}
@@ -168,12 +195,12 @@ def transcribe(audio_path, api_key, model_name, context, passes=1):
             pass_num = futures[future]
             results[pass_num] = future.result()
 
-    report, total_diffs = compare_passes(results)
+    report, total_diffs = compare_passes(results, temps)
 
     if total_diffs == 0:
         print(f"\nAll {passes} passes are identical — high confidence in accuracy.")
     else:
-        print(f"\nWARNING: {total_diffs} differences found across passes. Review the comparison report.")
+        print(f"\nFound {total_diffs} low-confidence differences across passes. Review the comparison report.")
 
     return results[1], results, report
 
@@ -195,8 +222,12 @@ def main():
         help="Gemini model to use (default: gemini-3.1-pro-preview)",
     )
     parser.add_argument(
-        "-p", "--passes", type=int, default=1,
-        help="Number of transcription passes for verification (default: 1, use 3 for verification)",
+        "-p", "--passes", type=int, default=3,
+        help="Number of transcription passes (default: 3). Uses varied temperatures to surface low-confidence regions.",
+    )
+    parser.add_argument(
+        "--temps",
+        help="Comma-separated temperature schedule (e.g. '0.0,0.2,0.3'). Overrides defaults.",
     )
     parser.add_argument(
         "--no-prompt", action="store_true",
@@ -213,6 +244,10 @@ def main():
         print(f"Error: file not found: {args.audio_file}", file=sys.stderr)
         sys.exit(1)
 
+    temps = None
+    if args.temps:
+        temps = [float(t.strip()) for t in args.temps.split(",")]
+
     if args.no_prompt:
         context = {
             "num_speakers": 2,
@@ -224,7 +259,7 @@ def main():
         context = get_context_from_user()
 
     transcript, all_results, report = transcribe(
-        args.audio_file, args.api_key, args.model, context, args.passes
+        args.audio_file, args.api_key, args.model, context, args.passes, temps
     )
 
     base = os.path.splitext(args.audio_file)[0]
@@ -233,7 +268,6 @@ def main():
     with open(output_path, "w") as f:
         f.write(transcript)
 
-    # Save individual passes and comparison report if multi-pass
     if all_results:
         for i, text in all_results.items():
             with open(f"{base}_transcript_pass{i}.md", "w") as f:
